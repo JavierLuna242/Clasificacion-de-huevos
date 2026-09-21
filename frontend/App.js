@@ -17,6 +17,7 @@ import { CLASSIFY_ENDPOINT } from './src/config';
 const COLORS = {
   good: '#34C759',
   bad: '#FF3B30',
+  neutral: '#8E8E93',
 };
 
 export default function App() {
@@ -61,12 +62,11 @@ export default function App() {
     setResult(null);
     try {
       const photo = await cameraRef.current.takePictureAsync({ quality: 0.6 });
+      // El objeto {uri,name,type} de FormData falla en RN nuevo ("Unsupported
+      // FormData part implementation"); un Blob real sí funciona siempre.
+      const blob = await (await fetch(photo.uri)).blob();
       const form = new FormData();
-      form.append('image', {
-        uri: photo.uri,
-        name: 'huevo.jpg',
-        type: 'image/jpeg',
-      });
+      form.append('image', blob, 'huevo.jpg');
 
       const res = await fetch(CLASSIFY_ENDPOINT, { method: 'POST', body: form });
       if (!res.ok) throw new Error(`Servidor respondió ${res.status}`);
@@ -81,6 +81,8 @@ export default function App() {
   };
 
   const isGood = result?.label === 'bueno';
+  const noEgg = !!result && !result.label;
+  const cardColor = noEgg ? COLORS.neutral : isGood ? COLORS.good : COLORS.bad;
 
   return (
     <View style={styles.container}>
@@ -107,7 +109,7 @@ export default function App() {
           style={[
             styles.resultCard,
             {
-              borderColor: isGood ? COLORS.good : COLORS.bad,
+              borderColor: cardColor,
               opacity: cardAnim,
               transform: [
                 { scale: cardAnim.interpolate({ inputRange: [0, 1], outputRange: [0.85, 1] }) },
@@ -116,11 +118,11 @@ export default function App() {
           ]}
         >
           <BlurView intensity={60} tint="dark" style={styles.resultCardBlur}>
-            <Text style={styles.resultEmoji}>{isGood ? '✅' : '❌'}</Text>
-            <Text style={[styles.resultLabel, { color: isGood ? COLORS.good : COLORS.bad }]}>
-              {isGood ? 'Huevo bueno' : 'Huevo roto'}
+            <Text style={styles.resultEmoji}>{noEgg ? '🥚' : isGood ? '✅' : '❌'}</Text>
+            <Text style={[styles.resultLabel, { color: cardColor }]}>
+              {noEgg ? 'No se detectó ningún huevo' : isGood ? 'Huevo bueno' : 'Huevo roto'}
             </Text>
-            {typeof result.confidence === 'number' && (
+            {!noEgg && typeof result.confidence === 'number' && (
               <Text style={styles.resultConfidence}>
                 {Math.round(result.confidence * 100)}% de confianza
               </Text>
