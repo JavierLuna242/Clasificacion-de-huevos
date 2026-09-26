@@ -1,6 +1,6 @@
 {
   "expo": {
-    "name": "Escaner de Huevos",
+    "name": "EggClassify",
     "slug": "escaner-huevos",
     "version": "1.0.0",
     "orientation": "portrait",

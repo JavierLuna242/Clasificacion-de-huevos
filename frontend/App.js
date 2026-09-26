@@ -1,51 +1,122 @@
-import { useRef, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import { BlurView } from 'expo-blur';
-import { LinearGradient } from 'expo-linear-gradient';
 import { StatusBar } from 'expo-status-bar';
-import {
-  Alert,
-  Animated,
-  Pressable,
-  SafeAreaView,
-  StyleSheet,
-  Text,
-  View,
-} from 'react-native';
+import { Image, Pressable, SafeAreaView, StyleSheet, Text, View, useWindowDimensions } from 'react-native';
 import { CLASSIFY_ENDPOINT } from './src/config';
+import logo from './assets/logo.jpg';
 
-const COLORS = {
-  good: '#34C759',
-  bad: '#FF3B30',
-  neutral: '#8E8E93',
-};
+const COLORS = { good: '#4caf82', bad: '#e2664f', accent: '#3a7bbf' };
+const SCAN_INTERVAL_MS = 1200;
+const TRACK_GRACE_MS = 2500; // ~2 capturas: un huevo que no se detecta una vez no desaparece de golpe
+
+function boxIou([ax1, ay1, ax2, ay2], [bx1, by1, bx2, by2]) {
+  const ix = Math.max(0, Math.min(ax2, bx2) - Math.max(ax1, bx1));
+  const iy = Math.max(0, Math.min(ay2, by2) - Math.max(ay1, by1));
+  const inter = ix * iy;
+  const union = (ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter;
+  return union > 0 ? inter / union : 0;
+}
+
+// Empareja las detecciones nuevas con las que ya veniamos mostrando (por
+// solape de caja) y les da un tiempo de gracia antes de quitarlas, para que
+// un solo frame fallido no las haga parpadear.
+function mergeDetections(tracked, detections, now) {
+  const used = new Set();
+  const kept = tracked.map((t) => {
+    let bestIdx = -1;
+    let bestIou = 0.3;
+    detections.forEach((d, i) => {
+      if (used.has(i)) return;
+      const v = boxIou(t.box, d.box);
+      if (v > bestIou) {
+        bestIou = v;
+        bestIdx = i;
+      }
+    });
+    if (bestIdx >= 0) {
+      used.add(bestIdx);
+      return { ...detections[bestIdx], lastSeen: now };
+    }
+    return t;
+  });
+
+  detections.forEach((d, i) => {
+    if (!used.has(i)) kept.push({ ...d, lastSeen: now });
+  });
+
+  return kept.filter((e) => now - e.lastSeen <= TRACK_GRACE_MS);
+}
 
 export default function App() {
   const [permission, requestPermission] = useCameraPermissions();
   const cameraRef = useRef(null);
+  const { width: winWidth } = useWindowDimensions();
+
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState(null);
+  const [paused, setPaused] = useState(false);
+  const [eggs, setEggs] = useState([]);
+  const [errorMsg, setErrorMsg] = useState(null);
+  // Relacion alto/ancho real de las fotos, calibrada con la primera captura.
+  // Sin esto el visor (fullscreen, "cover") recorta distinto que la foto que
+  // clasifica el modelo y las cajas quedan desalineadas.
+  const aspectRef = useRef(null);
 
-  const scale = useRef(new Animated.Value(1)).current;
-  const cardAnim = useRef(new Animated.Value(0)).current;
+  const scan = async () => {
+    if (!cameraRef.current) return;
+    setBusy(true);
+    try {
+      const shot = await cameraRef.current.takePictureAsync({ quality: 0.6, shutterSound: false });
+      if (aspectRef.current == null) {
+        const { width, height } = await new Promise((resolve, reject) =>
+          Image.getSize(shot.uri, (w, h) => resolve({ width: w, height: h }), reject)
+        );
+        aspectRef.current = height / width;
+      }
+      // El objeto {uri,name,type} de FormData falla en RN nuevo ("Unsupported
+      // FormData part implementation"); un Blob real sí funciona siempre.
+      const blob = await (await fetch(shot.uri)).blob();
+      const form = new FormData();
+      form.append('image', blob, 'huevo.jpg');
 
-  const pressIn = () =>
-    Animated.spring(scale, { toValue: 0.88, useNativeDriver: true, speed: 40 }).start();
-  const pressOut = () =>
-    Animated.spring(scale, { toValue: 1, useNativeDriver: true, speed: 20 }).start();
-
-  const showCard = () => {
-    cardAnim.setValue(0);
-    Animated.spring(cardAnim, { toValue: 1, useNativeDriver: true, speed: 14, bounciness: 8 }).start();
+      const res = await fetch(CLASSIFY_ENDPOINT, { method: 'POST', body: form });
+      if (!res.ok) throw new Error(`Servidor respondió ${res.status}`);
+      const data = await res.json();
+      setEggs((prev) => mergeDetections(prev, data.eggs ?? [], Date.now()));
+      setErrorMsg(null);
+    } catch (err) {
+      setErrorMsg('Sin conexión con el servidor, reintentando…');
+    } finally {
+      setBusy(false);
+    }
   };
 
-  if (!permission) return <View style={styles.container} />;
+  // Escaneo continuo: toma una foto, espera la respuesta y agenda la
+  // siguiente. Nunca hay dos peticiones en vuelo.
+  useEffect(() => {
+    if (!permission?.granted || paused) return undefined;
+    let cancelled = false;
+    let timer;
 
-  if (!permission.granted) {
+    const tick = async () => {
+      if (cancelled) return;
+      await scan();
+      if (!cancelled) timer = setTimeout(tick, SCAN_INTERVAL_MS);
+    };
+    tick();
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [permission?.granted, paused]);
+
+  if (!permission || !permission.granted) {
     return (
       <SafeAreaView style={styles.permissionContainer}>
-        <Text style={styles.permissionEmoji}>🥚</Text>
-        <Text style={styles.permissionTitle}>Escáner de Huevos</Text>
+        <Image source={logo} style={styles.permissionLogo} />
+        <Text style={styles.permissionTitle}>EggClassify</Text>
+        <Text style={styles.permissionTagline}>Clasificación de huevos fácil</Text>
         <Text style={styles.permissionText}>
           Necesitamos acceso a tu cámara para poder escanear y clasificar los huevos.
         </Text>
@@ -56,102 +127,58 @@ export default function App() {
     );
   }
 
-  const scan = async () => {
-    if (!cameraRef.current || busy) return;
-    setBusy(true);
-    setResult(null);
-    try {
-      const photo = await cameraRef.current.takePictureAsync({ quality: 0.6 });
-      // El objeto {uri,name,type} de FormData falla en RN nuevo ("Unsupported
-      // FormData part implementation"); un Blob real sí funciona siempre.
-      const blob = await (await fetch(photo.uri)).blob();
-      const form = new FormData();
-      form.append('image', blob, 'huevo.jpg');
+  const aspect = aspectRef.current ?? 4 / 3; // estimado hasta calibrar con la primera foto
+  const camWidth = winWidth;
+  const camHeight = winWidth * aspect;
 
-      const res = await fetch(CLASSIFY_ENDPOINT, { method: 'POST', body: form });
-      if (!res.ok) throw new Error(`Servidor respondió ${res.status}`);
-      const data = await res.json();
-      setResult(data);
-      showCard();
-    } catch (err) {
-      Alert.alert('Error al clasificar', err.message);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const isGood = result?.label === 'bueno';
-  const noEgg = !!result && !result.label;
-  const cardColor = noEgg ? COLORS.neutral : isGood ? COLORS.good : COLORS.bad;
+  let hint = 'Apunta la cámara a los huevos';
+  if (paused) hint = 'Escaneo en pausa';
+  else if (errorMsg) hint = errorMsg;
+  else if (busy) hint = 'Analizando…';
 
   return (
     <View style={styles.container}>
-      <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" />
+      <View style={[styles.camWrap, { width: camWidth, height: camHeight }]}>
+        <CameraView ref={cameraRef} style={StyleSheet.absoluteFill} facing="back" />
 
-      <LinearGradient
-        colors={['rgba(0,0,0,0.55)', 'transparent']}
-        style={styles.topGradient}
-        pointerEvents="none"
-      />
-      <SafeAreaView style={styles.header} pointerEvents="none">
-        <Text style={styles.headerText}>Escáner de Huevos</Text>
-      </SafeAreaView>
-
-      <View style={styles.guideFrame} pointerEvents="none">
-        <View style={[styles.corner, styles.cornerTL]} />
-        <View style={[styles.corner, styles.cornerTR]} />
-        <View style={[styles.corner, styles.cornerBL]} />
-        <View style={[styles.corner, styles.cornerBR]} />
+        {!paused &&
+          eggs.map((egg, i) => {
+            const isGood = egg.label === 'bueno';
+            const color = isGood ? COLORS.good : COLORS.bad;
+            const [x1, y1, x2, y2] = egg.box;
+            return (
+              <View
+                key={i}
+                style={[
+                  styles.box,
+                  {
+                    borderColor: color,
+                    left: x1 * camWidth,
+                    top: y1 * camHeight,
+                    width: (x2 - x1) * camWidth,
+                    height: (y2 - y1) * camHeight,
+                  },
+                ]}
+              >
+                <Text style={[styles.boxLabel, { backgroundColor: color }]}>
+                  {egg.label} {Math.round(egg.confidence * 100)}%
+                </Text>
+              </View>
+            );
+          })}
       </View>
 
-      {result && (
-        <Animated.View
-          style={[
-            styles.resultCard,
-            {
-              borderColor: cardColor,
-              opacity: cardAnim,
-              transform: [
-                { scale: cardAnim.interpolate({ inputRange: [0, 1], outputRange: [0.85, 1] }) },
-              ],
-            },
-          ]}
-        >
-          <BlurView intensity={60} tint="dark" style={styles.resultCardBlur}>
-            <Text style={styles.resultEmoji}>{noEgg ? '🥚' : isGood ? '✅' : '❌'}</Text>
-            <Text style={[styles.resultLabel, { color: cardColor }]}>
-              {noEgg ? 'No se detectó ningún huevo' : isGood ? 'Huevo bueno' : 'Huevo roto'}
-            </Text>
-            {!noEgg && typeof result.confidence === 'number' && (
-              <Text style={styles.resultConfidence}>
-                {Math.round(result.confidence * 100)}% de confianza
-              </Text>
-            )}
-          </BlurView>
-        </Animated.View>
-      )}
+      <SafeAreaView style={styles.header} pointerEvents="none">
+        <Image source={logo} style={styles.headerLogo} />
+        <Text style={styles.headerText}>EggClassify</Text>
+      </SafeAreaView>
 
       <BlurView intensity={50} tint="dark" style={styles.bottomPanel}>
         <SafeAreaView>
-          <Text style={styles.hint}>
-            {busy ? 'Analizando huevo…' : 'Centra el huevo en el marco y escanea'}
-          </Text>
-          <View style={styles.shutterRow}>
-            <Pressable
-              onPressIn={pressIn}
-              onPressOut={pressOut}
-              onPress={scan}
-              disabled={busy}
-              hitSlop={12}
-            >
-              <Animated.View
-                style={[
-                  styles.shutterOuter,
-                  { transform: [{ scale }], opacity: busy ? 0.5 : 1 },
-                ]}
-              >
-                <View style={styles.shutterInner} />
-              </Animated.View>
+          <Text style={styles.hint}>{hint}</Text>
+          <View style={styles.pauseRow}>
+            <Pressable style={styles.pauseButton} onPress={() => setPaused((p) => !p)} hitSlop={12}>
+              <Text style={styles.pauseButtonText}>{paused ? '▶  Reanudar' : '⏸  Pausar'}</Text>
             </Pressable>
           </View>
         </SafeAreaView>
@@ -162,78 +189,74 @@ export default function App() {
   );
 }
 
-const FRAME_SIZE = 240;
-
 const styles = StyleSheet.create({
-  container: { flex: 1, backgroundColor: '#000' },
+  container: { flex: 1, backgroundColor: '#000', alignItems: 'center', justifyContent: 'center' },
 
   permissionContainer: {
     flex: 1,
-    backgroundColor: '#0B0B0C',
+    backgroundColor: '#eaf3f8',
     alignItems: 'center',
     justifyContent: 'center',
     paddingHorizontal: 32,
-    gap: 12,
+    gap: 8,
   },
-  permissionEmoji: { fontSize: 56, marginBottom: 8 },
-  permissionTitle: { fontSize: 22, fontWeight: '700', color: '#fff' },
-  permissionText: { fontSize: 15, color: '#9BA1A6', textAlign: 'center', lineHeight: 21 },
+  permissionLogo: { width: 96, height: 96, borderRadius: 20, marginBottom: 8 },
+  permissionTitle: { fontSize: 24, fontWeight: '800', color: '#16324f' },
+  permissionTagline: { fontSize: 14, color: '#3a7bbf', fontWeight: '600', marginBottom: 8 },
+  permissionText: { fontSize: 15, color: '#708ba0', textAlign: 'center', lineHeight: 21 },
   permissionButton: {
     marginTop: 12,
-    backgroundColor: '#fff',
+    backgroundColor: '#3a7bbf',
     paddingVertical: 14,
     paddingHorizontal: 28,
     borderRadius: 999,
   },
-  permissionButtonText: { fontSize: 16, fontWeight: '600', color: '#000' },
+  permissionButtonText: { fontSize: 16, fontWeight: '600', color: '#fff' },
 
-  topGradient: {
+  camWrap: { backgroundColor: '#000' },
+
+  header: {
     position: 'absolute',
     top: 0,
     left: 0,
     right: 0,
-    height: 140,
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 8,
+    paddingTop: 8,
   },
-  header: { alignItems: 'center', paddingTop: 8 },
-  headerText: { color: '#fff', fontSize: 17, fontWeight: '600', letterSpacing: 0.3 },
+  headerLogo: {
+    width: 24,
+    height: 24,
+    borderRadius: 6,
+  },
+  headerText: {
+    color: '#fff',
+    fontSize: 17,
+    fontWeight: '600',
+    letterSpacing: 0.3,
+    textShadowColor: 'rgba(0,0,0,0.6)',
+    textShadowRadius: 4,
+  },
 
-  guideFrame: {
+  box: {
     position: 'absolute',
-    top: '50%',
-    left: '50%',
-    width: FRAME_SIZE,
-    height: FRAME_SIZE,
-    marginLeft: -FRAME_SIZE / 2,
-    marginTop: -FRAME_SIZE / 2 - 40,
+    borderWidth: 2.5,
+    borderRadius: 6,
   },
-  corner: {
+  boxLabel: {
     position: 'absolute',
-    width: 28,
-    height: 28,
-    borderColor: 'rgba(255,255,255,0.85)',
-  },
-  cornerTL: { top: 0, left: 0, borderTopWidth: 3, borderLeftWidth: 3, borderTopLeftRadius: 12 },
-  cornerTR: { top: 0, right: 0, borderTopWidth: 3, borderRightWidth: 3, borderTopRightRadius: 12 },
-  cornerBL: { bottom: 0, left: 0, borderBottomWidth: 3, borderLeftWidth: 3, borderBottomLeftRadius: 12 },
-  cornerBR: { bottom: 0, right: 0, borderBottomWidth: 3, borderRightWidth: 3, borderBottomRightRadius: 12 },
-
-  resultCard: {
-    position: 'absolute',
-    bottom: 220,
-    alignSelf: 'center',
-    borderRadius: 20,
-    borderWidth: 1.5,
+    top: -22,
+    left: -2.5,
+    color: '#fff',
+    fontSize: 12,
+    fontWeight: '700',
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: 4,
     overflow: 'hidden',
   },
-  resultCardBlur: {
-    paddingVertical: 18,
-    paddingHorizontal: 28,
-    alignItems: 'center',
-    gap: 4,
-  },
-  resultEmoji: { fontSize: 28 },
-  resultLabel: { fontSize: 19, fontWeight: '700' },
-  resultConfidence: { fontSize: 13, color: '#D1D1D6' },
 
   bottomPanel: {
     position: 'absolute',
@@ -249,22 +272,15 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     color: '#E5E5EA',
     fontSize: 14,
-    marginBottom: 18,
+    marginBottom: 16,
   },
-  shutterRow: { alignItems: 'center', paddingBottom: 14 },
-  shutterOuter: {
-    width: 78,
-    height: 78,
-    borderRadius: 39,
-    borderWidth: 4,
-    borderColor: 'rgba(255,255,255,0.9)',
-    alignItems: 'center',
-    justifyContent: 'center',
+  pauseRow: { alignItems: 'center', paddingBottom: 20 },
+  pauseButton: {
+    paddingVertical: 12,
+    paddingHorizontal: 24,
+    borderRadius: 999,
+    borderWidth: 1.5,
+    borderColor: 'rgba(255,255,255,0.4)',
   },
-  shutterInner: {
-    width: 64,
-    height: 64,
-    borderRadius: 32,
-    backgroundColor: '#fff',
-  },
+  pauseButtonText: { color: '#fff', fontSize: 15, fontWeight: '600' },
 });

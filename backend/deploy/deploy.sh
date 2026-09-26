@@ -6,14 +6,21 @@ HOST="ubuntu@54.83.16.222"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 KEY="$ROOT_DIR/losherederos.pem"
 BACKEND_DIR="$ROOT_DIR/backend"
+WEB_DIR="$ROOT_DIR/web"
 REMOTE_DIR="/home/ubuntu/egg-api"
 
 chmod 600 "$KEY"
 
-echo "Subiendo codigo y modelo a $HOST..."
+echo "Compilando la web..."
+(cd "$WEB_DIR" && npm run build >/dev/null)
+
+echo "Subiendo codigo, modelo y web a $HOST..."
 ssh -i "$KEY" -o StrictHostKeyChecking=accept-new "$HOST" "mkdir -p $REMOTE_DIR"
 scp -i "$KEY" -r "$BACKEND_DIR/app" "$BACKEND_DIR/model" "$BACKEND_DIR/requirements.txt" "$HOST:$REMOTE_DIR/"
+scp -i "$KEY" -r "$WEB_DIR/dist" "$HOST:$REMOTE_DIR/web_new"
+ssh -i "$KEY" "$HOST" "rm -rf $REMOTE_DIR/web && mv $REMOTE_DIR/web_new $REMOTE_DIR/web"
 scp -i "$KEY" "$BACKEND_DIR/deploy/egg-api.service" "$HOST:/tmp/egg-api.service"
+scp -i "$KEY" "$BACKEND_DIR/deploy/egg-api-tls.service" "$HOST:/tmp/egg-api-tls.service"
 
 echo "Instalando dependencias y arrancando el servicio..."
 ssh -i "$KEY" "$HOST" bash -s <<'REMOTE'
@@ -28,12 +35,21 @@ export TMPDIR="/home/ubuntu/egg-api/tmp-pip"  # /tmp tiene cuota chica en esta A
 ./venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu -q
 ./venv/bin/pip install -r requirements.txt -q
 rm -rf tmp-pip
+
+mkdir -p certs
+if [ ! -f certs/cert.pem ]; then
+  openssl req -x509 -newkey rsa:2048 -nodes -keyout certs/key.pem -out certs/cert.pem -days 825 -subj '/CN=54.83.16.222'
+fi
+
 sudo mv /tmp/egg-api.service /etc/systemd/system/egg-api.service
+sudo mv /tmp/egg-api-tls.service /etc/systemd/system/egg-api-tls.service
 sudo systemctl daemon-reload
-sudo systemctl enable egg-api
-sudo systemctl restart egg-api
+sudo systemctl enable egg-api egg-api-tls
+sudo systemctl restart egg-api egg-api-tls
 sleep 2
-sudo systemctl --no-pager --full status egg-api
+sudo systemctl --no-pager --full status egg-api egg-api-tls
 REMOTE
 
-echo "Listo. Prueba con: curl http://54.83.16.222:8000/health"
+echo "Listo."
+echo "API para la app movil (HTTP):  http://54.83.16.222:8080"
+echo "Web con camara (HTTPS, certificado autofirmado): https://54.83.16.222:8443"
