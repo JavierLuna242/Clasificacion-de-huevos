@@ -14,7 +14,7 @@ Proyecto de la asignatura Ciencia de Datos — 6.º semestre.
 - [Backend (API)](#backend-api)
 - [App móvil (Expo Go)](#app-móvil-expo-go)
 - [Web](#web)
-- [Despliegue en AWS EC2](#despliegue-en-aws-ec2)
+- [Despliegue (Azure + Cloudflare Tunnel)](#despliegue-azure--cloudflare-tunnel)
 - [Solución de problemas](#solución-de-problemas)
 
 ---
@@ -49,13 +49,11 @@ Proyecto de la asignatura Ciencia de Datos — 6.º semestre.
 ├── backend/            # API FastAPI + modelo YOLO11
 │   ├── app/main.py     # endpoints /health, /classify + sirve la web estatica
 │   ├── model/best.pt   # modelo entrenado (clases: bueno, roto)
-│   ├── requirements.txt
-│   └── deploy/         # systemd units + script de despliegue al EC2
+│   └── requirements.txt
 ├── frontend/            # App Expo (React Native) para Expo Go
 │   └── App.js
 ├── web/                 # App web (React + Vite)
 │   └── src/App.jsx
-└── losherederos.pem     # llave SSH de la instancia EC2 (no se sube a git)
 ```
 
 ---
@@ -68,13 +66,13 @@ Proyecto de la asignatura Ciencia de Datos — 6.º semestre.
 | Backend   | FastAPI, Uvicorn, Pillow, PyTorch (CPU)                             |
 | App móvil | Expo SDK 57, React Native, `expo-camera`, `expo-blur`               |
 | Web       | React 19, Vite, cámara del navegador (`getUserMedia`)               |
-| Servidor  | AWS EC2 (Ubuntu), systemd, certificado TLS autofirmado              |
+| Servidor  | Debian (Azure) con dominio + Cloudflare Tunnel                           |
 
 ---
 
 ## Backend (API)
 
-Corre en la instancia EC2, siempre activo mientras la instancia esté encendida.
+Corre en la VM de Azure, siempre activo mientras la VM esté encendida.
 
 - **`GET /health`** — chequeo de salud (`{"status": "ok"}`).
 - **`POST /classify`** — recibe el campo `image` (form-data) y devuelve las detecciones (ver [Cómo funciona](#cómo-funciona)).
@@ -93,7 +91,7 @@ cd backend
 python3 -m venv venv
 ./venv/bin/pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 ./venv/bin/pip install -r requirements.txt
-./venv/bin/uvicorn app.main:app --reload --port 8080
+./venv/bin/uvicorn app.main:app --reload --port 8082
 ```
 
 ---
@@ -121,41 +119,33 @@ npm run dev      # desarrollo, http://localhost:5173
 npm run build    # build de produccion -> web/dist/
 ```
 
-Requiere HTTPS (o `localhost`) para que el navegador permita usar la cámara — por eso en producción se sirve por `https://54.83.16.222:8443` (ver [Despliegue](#despliegue-en-aws-ec2)).
+Requiere HTTPS (o `localhost`) para que el navegador permita usar la cámara — por eso en producción se sirve por `https://eggclassify.javier.life` (ver [Despliegue](#despliegue-azure--cloudflare-tunnel)).
 
 La URL del backend está en [`web/src/config.js`](web/src/config.js).
 
 ---
 
-## Despliegue en AWS EC2
+## Despliegue (Azure + Cloudflare Tunnel)
 
-Todo el despliegue (backend + modelo + web) se hace con un solo script:
+La API y la web corren juntas en una VM Debian 12 de Azure (≥ 2 vCPU / 4 GB RAM, usuario `azureuser`), publicadas en **https://eggclassify.javier.life** mediante un Cloudflare Tunnel (HTTPS real, sin abrir puertos; solo el 22 para SSH).
 
-```bash
-bash backend/deploy/deploy.sh
+**Cloudflare** (Zero Trust → Networks → Tunnels): Public hostname con subdominio `EggClassify`, dominio `javier.life` y Service URL `http://localhost:8082`. La VM corre `cloudflared` como servicio.
+
+**En la VM**, en `~/egg-api/`:
+
+```
+app/  model/best.pt  requirements.txt  web/ (build de Vite)  venv/
 ```
 
-Qué hace:
+- Crear el entorno: `python3 -m venv venv`, luego `pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu` y `pip install -r requirements.txt` (necesita `libgl1` y `libglib2.0-0`).
+- Servicio `systemd` `egg-api` que ejecuta `venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8082` (solo local: el tunnel es la única entrada).
 
-1. Compila la web (`npm run build`).
-2. Sube el código, el modelo y la web compilada a la instancia por `scp`.
-3. Instala dependencias del sistema y del `venv` de Python.
-4. Genera un certificado TLS autofirmado si no existe (`backend/certs/` en el servidor).
-5. Instala y reinicia dos servicios `systemd`, ambos habilitados para arrancar solos si la instancia se reinicia:
-
-| Servicio            | Puerto | Protocolo | Para                                  |
-| -------------------- | ------ | --------- | -------------------------------------- |
-| `egg-api.service`     | 8080   | HTTP      | App móvil (Expo Go, sin restricción de HTTPS) |
-| `egg-api-tls.service` | 8443   | HTTPS     | Web (el navegador exige HTTPS para dar acceso a la cámara) |
-
-Ambos puertos deben estar abiertos en el **Security Group** de la instancia (Custom TCP, origen `0.0.0.0/0`).
-
-> El certificado de `egg-api-tls` es autofirmado (no hay dominio propio), así que el navegador muestra una advertencia la primera vez — hay que aceptar "Avanzado → Continuar" una sola vez por dispositivo.
+**Actualizar:** compilar la web (`npm run build` en `web/`), subir `web/dist` como `~/egg-api/web` (y `backend/app` y `backend/model` si cambiaron) y ejecutar `sudo systemctl restart egg-api`.
 
 ---
 
 ## Solución de problemas
 
-- **La web no carga tras apagar/prender la instancia**: revisa si la IP pública cambió (pasa si la instancia no tiene una *Elastic IP* asignada). Los servicios arrancan solos, pero si la IP cambió hay que actualizar `frontend/src/config.js`, `web/src/config.js` y volver a desplegar.
+- **La web no carga tras reiniciar la VM**: revisa `sudo systemctl status egg-api cloudflared`; ambos arrancan solos. Como el acceso es por el tunnel, la IP pública de la VM puede cambiar sin afectar nada.
 - **La cámara no funciona en el navegador**: solo funciona sobre HTTPS o `localhost` — asegúrate de entrar por `https://` y no por `http://`.
 - **Detecciones erráticas / parpadeo**: ver el bloque `mergeDetections` en `frontend/App.js` y `web/src/App.jsx` — cada huevo se mantiene visible ~2.5 s desde la última vez que se detectó, para suavizar fallos de un solo frame.

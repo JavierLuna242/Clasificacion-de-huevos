@@ -17,3 +17,6 @@ web-build/
 
 # OS
 .DS_Store
+
+# Scripts de despliegue (no se suben)
+backend/deploy/
